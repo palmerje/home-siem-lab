@@ -68,11 +68,19 @@ Building this lab surfaced a wide range of real infrastructure problems — solv
 
 `Linux administration` `Security Onion / Zeek / Suricata` `Elasticsearch & Kibana query fundamentals` `MITRE ATT&CK / Atomic Red Team` `VMware networking (NAT, host-only, promiscuous mode)` `LVM & disk troubleshooting` `Windows hypervisor/VBS internals` `Host-based firewall configuration` `PowerShell` `Root-cause troubleshooting methodology`
 
+## Endpoint Telemetry (Sysmon + Elastic Agent)
+
+Identified a real visibility gap in the initial network-only setup: two separate investigations (T1003-7 self-loopback, T1105 blocked-before-network) showed activity that Zeek/Suricata structurally could not see. Closed this gap by:
+
+- Installing **Sysmon** on the Windows target (SwiftOnSecurity community config)
+- Enrolling Windows as an **Elastic Agent** endpoint in Security Onion's Fleet, with the **Custom Windows Event Logs** integration configured against the `Microsoft-Windows-Sysmon/Operational` channel
+
+**Verified the fix directly**: re-ran the identical T1003-7 self-loopback test that had previously produced zero results anywhere. This time, Sysmon captured the process execution (`event.code: 1`, Process Create) at the host level — proving the endpoint telemetry closes exactly the gap the network sensor couldn't cover. This mirrors real SOC architecture: layered detection across multiple telemetry sources rather than a single point of visibility.
+
 ## What's Next
 
 - Enable a horizontal port-scan detection rule and re-run T1046-10 to confirm it alerts once tuned
-- Add endpoint-level telemetry (Sysmon or Elastic Agent on the Windows target) to close the network-visibility gap identified in the T1003 investigation
-- Expand to additional ATT&CK techniques with more built-in signature coverage
+- Expand to additional ATT&CK techniques with more built-in signature coverage, now testing detection across both network and endpoint layers
 
 ---
 *Full raw troubleshooting log and session-by-session notes available in [`LAB_NOTES.md`](./LAB_NOTES.md).*

