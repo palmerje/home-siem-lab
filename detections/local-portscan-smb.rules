@@ -1,0 +1,7 @@
+# Custom Suricata rule — horizontal SMB (TCP/445) port-scan detection
+# Author: Jearld Palmer | Home SIEM Lab (Security Onion 2.4)
+# MITRE ATT&CK: T1046 (Network Service Discovery)
+# Local SID range (1000000+). detection_filter "count" is tuned to the lab's
+# observed baseline (see README.md for the full tuning story).
+
+alert tcp $HOME_NET any -> any 445 (msg:"LOCAL SMB Horizontal Port Scan Detected (T1046)"; flags:S; detection_filter:track by_src, count 3, seconds 60; classtype:attempted-recon; sid:1000001; rev:2;)

@@ -167,3 +167,140 @@ Invoke-AtomicTest T1003-7 -InputArgs @{ "server_ip" = "192.168.50.129"; "custom_
 This time, Hunt search for `*rpcping*` (last 15 minutes) returned **6 real events**, dataset `winlog.winlog` — confirming Sysmon captured the process execution at the host level, even though the network-layer traffic still never left the loopback interface (as expected, since self-targeting inherently bypasses the network stack).
 
 **This is direct, reproducible proof that the endpoint telemetry addition closes the exact gap identified three investigations ago.** Same command, same target, same complete absence of network-layer evidence — but now with full host-level visibility via Sysmon that didn't exist before. This is the strongest single piece of evidence in the lab for demonstrating an understanding of layered/defense-in-depth detection architecture.
+
+## Day 6 — Threat Hunt: Testing Sysmon Visibility Against T1046-10 (Port Scan)
+
+### Hypothesis
+Following the CySA+ "Threat Hunting" methodology (form a hypothesis, assume existing detection has failed), tested: *"A port scan from the Windows endpoint would be visible in Sysmon Network Connection events (event.code 3), even though it generates no Suricata alert (known gap from Day 3-4 investigation)."*
+
+### Method
+Re-ran `Invoke-AtomicTest T1046-10` (scanned 192.168.128.1-254 on port 445, NAT subnet this time). Hunted Security Onion via `event.code:3`, then narrowed by destination port using the click-to-filter method (confirmed correct field: `winlog.event_data.DestinationPort`).
+
+### Result
+Of ~254 scan targets, Sysmon logged only **1** Network Connection event on port 445 — the single target that actually had something listening (ironically, the scanning host itself, `192.168.128.132`). Verified independently at the Windows OS level (`Get-WinEvent` directly against the Sysmon operational log) — confirmed only 1 real Event ID 3 existed locally, ruling out a shipping/ingestion problem between Windows and Security Onion.
+
+### Conclusion — a real, nuanced telemetry limitation
+**Sysmon's Event ID 3 (Network Connection) only logs successfully established TCP connections, not failed/refused connection attempts.** Since a port scan against mostly-closed ports is defined by its pattern of failures (253 refused attempts vs. 1 success here), Sysmon structurally cannot see "a scan" as a scan — it can only ever show the rare successful hit, which in isolation looks like unremarkable normal traffic, not a security event.
+
+**This means network-layer sensors (Zeek/Suricata) remain structurally better suited to detecting scanning behavior** than endpoint telemetry (Sysmon), since Zeek/Suricata observe raw packets regardless of connection success — the reverse of the T1003/T1105 findings from Day 4-5, where endpoint telemetry outperformed the network sensor. **Neither telemetry source is universally superior — each has behaviors it's structurally better positioned to observe**, reinforcing the case for the layered/hybrid approach already built into this lab.
+
+**Write-up / CySA+ connection:** This hunt began from the "assume existing detection has failed" principle taught in the Threat Hunting objective, and produced an honestly negative-but-informative result — a legitimate and common outcome of real threat hunting, not a failure of the exercise. Strong concrete example for explaining detection engineering trade-offs (network vs. endpoint visibility) in an interview.
+
+---
+
+## Planned Next Lab — Custom Suricata Rule: Detect the T1046-10 Scan + Dissect sid:2067085
+*(Queued 2026-07-29. Ties together three threads: the Day 3 open item "enable a horizontal port-scan rule and re-run T1046-10", the pending CySA+ Exercise 3 "sid:2067085 lookup", and the Snort/Suricata rule anatomy from CySA+ study guide pp. 70-71. This is a full detection-engineering loop: identify a gap → author a signature → validate it fires.)*
+
+### Objective
+Close the oldest unresolved detection gap in the lab. On Day 3, T1046-10 generated real scan traffic that Zeek logged (`conn_state: S0`) but Suricata never alerted on, because horizontal port-scan signatures are disabled by default in the ET Open ruleset. Now that the rule-writing syntax is covered, write a **custom local rule** that detects the scan, deploy it, and re-run T1046-10 to watch a self-authored signature fire.
+
+### Part A — Dissect the existing alert (closes CySA+ Exercise 3)
+Before writing a rule, read one. In the SOC web UI, open **Alerts** (or **Detections**) and find the captured `ET INFO NTLM Session Setup Request - Negotiate`, **sid 2067085**. Map each field of the live rule to the anatomy taught on study-guide p. 71:
+
+```
+alert   tcp-pkt   $HOME_NET any -> any 445   ( msg:"..."; flow:established,to_server; content:"NTLMSSP|00 01 00 00 00|"; ... sid:2067085; rev:...; )
+  |        |            |                          |            |                          |                                 |
+action  protocol   src -> dst (net/port/dir)     msg          flow                     content (payload match)          sid / rev
+```
+
+- **action** = `alert` (log + notify, no block) → this is why the alert showed `rule.action: allowed`: Suricata is running as an **IDS**, not an IPS (confirms the CySA+ IDS-vs-IPS distinction against real lab data).
+- **`$HOME_NET any -> any 445`** = source is the monitored network on any port, destination is any host on port 445; `->` is unidirectional.
+- **`flow:established,to_server`** = only inspect packets after the TCP handshake completes, in the client→server direction (why the Day 4 self-loopback and dead-host attempts never matched — no established flow / no server-side content).
+- **`content:"NTLMSSP|00 01 00 00 00|"`** = the literal payload bytes the signature hunts for (the `|..|` is hex). This is the exact `NTLMSSP` string traced on the wire back on Day 4.
+- **sid / rev** = signature ID + revision.
+
+Record in the log which real field values you saw in the alert detail vs. the rule definition.
+
+### Part B — Write and deploy a custom scan-detection rule
+
+**Starter rule** (SID in the local range `1000000+` to avoid collisions with ET Open):
+
+```
+alert tcp $HOME_NET any -> any 445 (msg:"LOCAL SMB Horizontal Port Scan Detected (T1046)"; flags:S; detection_filter:track by_src, count 20, seconds 60; classtype:attempted-recon; sid:1000001; rev:1;)
+```
+
+Field-by-field (this is the write-up gold — you authored every choice):
+- **`flags:S`** — match SYN-only packets, i.e. connection *attempts*. This is the key to catching a scan against closed ports (the `S0` connections from Day 3) that never establish a flow, which is exactly why the payload-based sid:2067085 style could never see the scan.
+- **`detection_filter:track by_src, count 20, seconds 60`** — the actual "scan" logic: only alert once a **single source** sends **20+** SYNs to port 445 within **60 seconds**. One connection to 445 is normal; twenty in a minute from one host is a horizontal sweep. Tuning these numbers is the analyst judgment call — note your reasoning.
+- **`classtype:attempted-recon`** — categorizes the alert (maps cleanly to MITRE T1046 / Kill Chain Reconnaissance).
+- **`sid:1000001; rev:1`** — local SID, first revision.
+
+**Deploy (Security Onion 2.4 — Detections UI method, preferred):**
+1. In the SOC web UI, go to **Detections**.
+2. Click the blue **+** button (between Options and the query bar).
+3. Set **Language = Suricata**.
+4. Paste the rule, click **CREATE**.
+5. The detection deploys on the next sync cycle (~15 minutes). Confirm it appears in the Detections list as enabled.
+
+*Fallback (file-based):* custom `.rules` files can be dropped in `/nsm/rules/custom-local-repos/local-suricata/`, but the UI is preferred — a manual file can be re-imported/overwritten on each sync, and the UI validates syntax on CREATE. Use the UI unless it's unavailable.
+
+### Part C — Validate
+1. From the Windows target, re-run: `Invoke-AtomicTest T1046-10` (scan a /24 on port 445, same as Day 3/Day 6).
+2. In the SOC UI **Alerts**, filter for `LOCAL SMB Horizontal Port Scan Detected` (or `rule.uuid` / `sid 1000001`).
+3. **Expected:** the custom rule fires (whereas Day 3 produced no Suricata alert for the same traffic). Cross-check that the same scan still appears in Zeek `conn.log` as before — the traffic didn't change, only the detection did.
+
+### What to record afterward
+- Whether the rule fired, and the count/window values that worked (tune if it was too noisy or missed).
+- The before/after contrast: identical scan traffic, no alert on Day 3 → alert now, because *I wrote the signature*.
+- Any deploy friction (sync delay, syntax validation, `$HOME_NET` scope on the NAT vs. VMnet2 subnet).
+
+### Why this matters (portfolio / interview angle)
+This is the strongest single detection-engineering narrative in the lab so far: "I identified a real gap (scan traffic captured but not alerted), understood *why* at the packet level (SYN-only attempts, no established flow, default sigs disabled), authored a custom Suricata rule with an appropriate `detection_filter` threshold, deployed it through Security Onion's Detections pipeline, and validated it fired against the same emulated attack." Directly exercises CySA+ Domain 1 (Obj 1.3 tools/techniques + IDS/IPS rule logic) with hands-on evidence.
+
+---
+
+## Upcoming Self-Study Projects (queued 2026-09-22 — full detail in SELF_STUDY_PLAN.md)
+Bridge projects between now and the WGU M.S. start (Nov 2026), ordered by ROI. Each maps to an upcoming master's cert and produces a portfolio artifact.
+1. ~~**Finish this custom Suricata loop** — Phase 0~~ ✅ **DONE 2026-10-12** (see Day 7 below).
+2. ~~**GRC / RMF artifact**~~ ✅ **DONE 2026-10-15** — SSP written (NIST 800-53 Rev 5 LOW, RMF-structured): `portfolio/grc-rmf-ssp/Palmer_SSP_Home_SIEM_Lab.docx`. FIPS 199 categorization, 20 controls, risk assessment, POA&M, 800-171/CMMC mapping.
+3. **Purple-team the lab** — add a vulnerable target, attack from Kali, detect/investigate in Security Onion; map to ATT&CK. Previews PenTest+.
+4. **Vulnerability management** — OpenVAS/Nessus scan → CVSS → remediate → CISA KEV cross-ref → report. Previews SecurityX.
+5. **Cloud security starter** — AWS/Azure free tier: harden + enable logging (CloudTrail/GuardDuty); optional SIEM shipping. Closes cloud gap; can roll into the master's.
+
+Running threads: build a public detections/portfolio repo, and post one short LinkedIn write-up per finished project.
+
+---
+
+## Day 7 — Custom Suricata Rule: Full Detection-Engineering Loop (COMPLETE)
+*2026-10-12. Closes the Day 3 open item ("enable a horizontal port-scan rule and re-run T1046-10"), the pending Exercise 3 (sid:2067085 dissection, done in an earlier session), and Phase 0 of the self-study plan. This is the strongest single detection-engineering artifact in the lab.*
+
+### Goal
+Author a custom Suricata rule to detect the T1046-10 port scan that Zeek captured but the default ET ruleset never alerted on (Day 3 finding), then deploy and validate it.
+
+### Part A — Dissected the model rule (sid:2067085)
+Walked the live `ET INFO NTLM Session Setup Request - Negotiate` rule field-by-field against the Snort/Suricata anatomy. Confirmed `rule.action: allowed` = Suricata running as an **IDS** (not IPS), and that `flow:established,to_server` is exactly why the Day 4 dead-host/self-loopback attempts never alerted.
+
+### Part B — Authored and deployed the custom rule
+Created via SOC **Detections → + → Suricata**, License **DRL-1.1**, Ruleset **Custom**:
+```
+alert tcp $HOME_NET any -> any 445 (msg:"LOCAL SMB Horizontal Port Scan Detected (T1046)"; flags:S; detection_filter:track by_src, count 20, seconds 60; classtype:attempted-recon; sid:1000001; rev:1;)
+```
+**Gotcha #1:** SO 2.4 creates custom detections **Disabled by default** — had to flip Status to Enabled, then wait for the ~15-min sync to push it to Suricata.
+
+### Part C — Validation and the debugging journey (the valuable part)
+
+**Gotcha #2 — wrong subnet (dual-homed host).** First `Invoke-AtomicTest T1046-10` auto-selected the Windows VM's **NAT** interface (Ethernet1, 192.168.128.x) and scanned the NAT subnet — which the sensor doesn't monitor. No alert. Same blind spot as Day 6.
+- **Fix:** temporarily `Disable-NetAdapter` on the NAT adapter so the atomic auto-selected the **VMnet2** interface (Ethernet0, 192.168.50.129); re-ran → scanned 192.168.50.0/24; then re-enabled NAT. (SOC UI is served from the host browser, so disabling the VM's NAT adapter didn't affect access; the Elastic agent reconnected after.)
+
+**Still no alert — diagnosed instead of guessing.** Confirmed the rule was **Enabled** and **Suricata: OK** (deployment fine). Then hunted the traffic:
+```
+source.ip:"192.168.50.129" AND destination.port:445   (Hunt, last 1h)
+```
+Result: only **4** connection attempts — three SYNs to `192.168.50.1` within ~15s (same src port = SYN retransmits of one attempt) and one to `192.168.50.254`, spread across ~2 minutes.
+- **Root cause:** `count 20, seconds 60` was never reachable. On an isolated host-only /24, Windows only emits a SYN to hosts that answer ARP (the virtual `.1` and `.254`); every dead IP produces no packet at all. A real populated /24 throws hundreds of SYNs; this quiet lab throws ~4. The rule wasn't broken — the **threshold didn't match the environment's baseline**.
+
+**Tuned to the environment.** Edited the rule: `count 20 → 3`, `rev 1 → 2` (3 matches the observed 3-attempt burst to `.1` within 15s). Re-synced, re-ran the VMnet2 scan.
+
+### Result — CONFIRMED FIRE
+Alert triggered: **"LOCAL SMB Horizontal Port Scan Detected (T1046)"**, `rule.uuid 1000001`, `event.module: suricata`, `event.severity_label: medium`, `rule.category: Attempted Information Leak` (Suricata maps `classtype:attempted-recon` → that category + medium priority), source `192.168.50.129` → dest `192.168.50.1:445`, @ 14:44:01 (2026-10-12). Visible in both **Alerts** and **Hunt** (the `suricata.alert` event sitting next to the `zeek.conn` records that generated it).
+
+### Lessons / write-up angles
+- **Thresholds must be tuned to the environment baseline, not copied from defaults** — the single biggest takeaway. The *method* (observe real traffic volume → set threshold) matters more than the number; `count 3` is right for this lab, `20+` for a populated network.
+- **Dual-homed detection gotcha:** an atomic auto-selects an interface; forcing traffic onto the monitored segment required disabling the other adapter.
+- **Analyst workflow demonstrated end-to-end:** hypothesis → signature authoring → negative result → telemetry verification in Hunt → root-cause (threshold vs. baseline) → tune → confirm. The negative-then-fixed path is the realistic, interview-worthy version of this story.
+- **Interview one-liner:** "I identified a detection gap, wrote a custom Suricata rule, and when it didn't fire I pulled the Zeek telemetry, found my threshold was mismatched to the network's baseline, tuned it, and validated the alert end to end in Security Onion."
+
+### Next
+- Capture screenshots (rule, Hunt diagnosis, fired alert) for the portfolio.
+- Add the rule + this write-up to a public detections repo; draft a short LinkedIn post.
+- Move to Phase 1 (GRC / RMF artifact) per SELF_STUDY_PLAN.md.
