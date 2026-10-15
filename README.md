@@ -6,6 +6,11 @@ A self-built Security Onion SIEM lab used to practice detection engineering, thr
 
 I'm a cleared IT/security professional (COMSEC, information assurance, tactical network integration) transitioning toward security analyst and software development roles. This lab is where I'm building hands-on SOC/detection experience to complement that background.
 
+## Featured Work
+
+- **[Custom Suricata Port-Scan Detection (T1046)](detections/README.md)** — wrote a network IDS rule, diagnosed why it didn't fire using Hunt telemetry, then tuned it to the environment's baseline. End-to-end detection engineering, with screenshots.
+- **[System Security Plan — NIST 800-53 / RMF](grc/SSP_Home_SIEM_Lab.md)** — a full SSP for this lab: FIPS 199 categorization, 20 controls, risk assessment, POA&M, and an 800-171/CMMC mapping.
+
 ## Architecture
 
 ```
@@ -40,6 +45,8 @@ I'm a cleared IT/security professional (COMSEC, information assurance, tactical 
 Ran a PowerShell-based `/24` subnet port scan (T1046-10) from the Windows target. Confirmed via `tcpdump` and Zeek's `conn.log` that the scan traffic was captured and logged correctly (`S0` connection states across many destination IPs, port 445) — but **no Suricata alert fired**.
 
 **Finding:** Horizontal port-scan detection signatures are disabled by default in Suricata's ET Open ruleset (a conservative default to reduce noise in production). This is a legitimate, common analyst scenario: traffic can be fully visible in logs while still not triggering an alert, depending on which signatures are enabled. Confirmed the detection pipeline itself was healthy via a separate real alert, ruling out a broken sensor.
+
+> **Follow-up:** I later closed this exact gap by writing a custom Suricata rule for horizontal SMB scans, then diagnosed why it didn't fire and tuned it to the lab's traffic baseline. Full write-up → [Custom Suricata Port-Scan Detection (T1046)](detections/README.md).
 
 ### 2. T1003 — OS Credential Dumping (NTLM hash disclosure via RPC)
 Ran the same technique (`T1003-7`, forcing an NTLM hash negotiation via `rpcping`) against three different targets to understand what a network sensor can and can't see:
