@@ -304,3 +304,41 @@ Alert triggered: **"LOCAL SMB Horizontal Port Scan Detected (T1046)"**, `rule.uu
 - Capture screenshots (rule, Hunt diagnosis, fired alert) for the portfolio.
 - Add the rule + this write-up to a public detections repo; draft a short LinkedIn post.
 - Move to Phase 1 (GRC / RMF artifact) per SELF_STUDY_PLAN.md.
+
+---
+
+## Day 9 — Purple-Team: vsftpd 2.3.4 Backdoor vs. Security Onion (Phase 2 COMPLETE)
+*2026-10-26. Full red→blue loop with a detection-engineering capstone. Deliverable write-up: `portfolio/purple-team-vsftpd/`. Closes Phase 2 of the self-study plan.*
+
+### Setup
+Added **Metasploitable 2** (`192.168.50.131`) to the isolated VMnet2 segment (host-only, never bridged — it is intentionally vulnerable). Attacker: **Kali** (`192.168.50.130`). Windows VM left off to save RAM. (Metasploitable crashed once mid-exercise — likely host RAM contention; a cold restart fixed it and kept the same DHCP IP.)
+
+### Red — attack chain
+1. **Recon (T1595/T1046):** `sudo nmap -sV 192.168.50.131` — enumerated 23 services incl. vsftpd 2.3.4, Samba 3.x, UnrealIRCd, Java RMI, Tomcat.
+2. **Initial Access (T1190, CVE-2011-2523):** vsftpd 2.3.4 backdoor. Metasploit module failed on this build (v6.4.135 — `cmd/unix/interact` payload no longer compatible; default reverse payload can't work against a raw bind backdoor), so exploited **manually** with netcat: `nc …131 21` → `USER backdoor:)` / `PASS x` opens a root bind shell on TCP/6200 → `nc …131 6200` → `id` = `uid=0(root)`.
+3. **Foothold:** root on the target.
+
+### Blue — reconstruction in Security Onion
+- **Recon: heavily detected** — 44 alerts across 15 signatures (ET SCAN Nmap UA, GPL RPC portmap, ET SCAN suspicious-inbound to DB ports, ET INFO RMI/GIOP/IRC, ET INFO Kali-hostname-in-DHCP).
+- **Exploit + foothold: DETECTION GAP** — no alert on the `:)` backdoor login or the 6200 root shell. Confirmed it was a *detection* gap, not a *visibility* gap, via Hunt: `destination.port:6200` → 1 zeek.conn; `destination.port:21` → 3 zeek.conn (one tagged `protocol: ftp`). Sensor saw the whole compromise; no rule flagged it.
+- **Key insight:** recon is over-detected (noisy, signature-rich); exploitation and C2 are under-detected. A SOC on alerts alone would see "a scan" and miss that the box was rooted.
+
+### Detection engineering — closed the gap
+Wrote + deployed custom Suricata rule **sid:1000002**:
+```
+alert tcp $HOME_NET any -> $HOME_NET 21 (msg:"LOCAL vsftpd 2.3.4 Backdoor Smiley Login (CVE-2011-2523, T1190)"; flow:established,to_server; content:"USER "; nocase; content:"|3a 29|"; distance:0; classtype:attempted-admin; sid:1000002; rev:1;)
+```
+- `|3a 29|` = hex `:)`. Scoped `$HOME_NET -> $HOME_NET` because the lab is flat/internal — the stock ET rule's `$EXTERNAL_NET -> $HOME_NET` is likely why it never fired here.
+- **Validated:** re-sent the smiley login; the backdoor itself failed this time (`500 OOPS: priv_sock_get_result`, no shell) but the rule **still fired** (sid 1000002, high, dst 192.168.50.131:21). Detecting the *attempt*, not just success, is the point.
+
+### Lessons / write-up angles
+- Recon over-detected, exploitation/C2 under-detected — mirrors real breaches.
+- Detect the attempt, not just success.
+- Ruleset network-variable scoping (`$EXTERNAL_NET` vs `$HOME_NET`) silently breaks detections in a flat topology.
+- When the tool breaks (Metasploit payload), understanding the vuln lets you exploit manually — a real pentester skill.
+- **Interview one-liner:** "I ran a purple-team exercise, compromised a host via the vsftpd backdoor, found the exploit and foothold produced zero alerts despite being fully captured, wrote a Suricata rule to detect the backdoor login, and validated it fired — even on a failed attempt."
+
+### Next
+- Screenshots (recon alerts, Hunt gap, fired custom alert) in `portfolio/purple-team-vsftpd/images/`.
+- Add write-up + rule to the home-siem-lab repo; optional LinkedIn post.
+- Phase 3 (vuln management) or Phase 4 (cloud) next.
