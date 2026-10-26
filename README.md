@@ -8,8 +8,9 @@ I'm a cleared IT/security professional (COMSEC, information assurance, tactical 
 
 ## Featured Work
 
-- **[Custom Suricata Port-Scan Detection (T1046)](detections/README.md)** — wrote a network IDS rule, diagnosed why it didn't fire using Hunt telemetry, then tuned it to the environment's baseline. End-to-end detection engineering, with screenshots.
-- **[System Security Plan — NIST 800-53 / RMF](grc/SSP_Home_SIEM_Lab.md)** — a full SSP for this lab: FIPS 199 categorization, 20 controls, risk assessment, POA&M, and an 800-171/CMMC mapping.
+- **[Custom Suricata Port-Scan Detection (T1046)](detections/README.md)** — wrote a network IDS rule, diagnosed why it didn't fire using Hunt telemetry, and tuned it to the environment's baseline. End-to-end detection engineering.
+- **[Purple-Team: vsftpd Backdoor vs. Security Onion (T1190)](purple-team-vsftpd/README.md)** — compromised a target from Kali, found the exploit and root foothold produced no alerts, then wrote and validated a custom Suricata rule to catch the backdoor login.
+- **[System Security Plan — NIST 800-53 / RMF](grc/SSP_Home_SIEM_Lab.md)** — a full SSP for the lab: FIPS 199 categorization, 20 controls, risk assessment, POA&M, and an 800-171/CMMC mapping.
 
 ## Architecture
 
